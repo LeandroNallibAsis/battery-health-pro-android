@@ -7,8 +7,11 @@ import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.os.BatteryManager
 import android.os.Build
+import android.os.IBinder
+import android.os.ParcelFileDescriptor
 import java.io.BufferedReader
 import java.io.File
+import java.io.FileInputStream
 import java.io.InputStreamReader
 import kotlin.math.abs
 import kotlin.math.roundToInt
@@ -49,6 +52,12 @@ object BatteryHealthReader {
   private const val PREFS_NAME = "battery_health_prefs"
   private const val KEY_CALIBRATED_FULL_MAH = "calibrated_full_mah"
   private const val KEY_CUSTOM_DESIGN_MAH = "custom_design_mah"
+  private const val KEY_CACHED_ASOC = "cached_asoc"
+  private const val KEY_CACHED_BSOH = "cached_bsoh"
+  private const val KEY_CACHED_USAGE = "cached_usage"
+  private const val KEY_CACHED_FIRST_USE = "cached_first_use"
+  private const val KEY_CACHED_PART = "cached_part"
+  private const val KEY_CACHED_QR = "cached_qr"
 
   fun readSnapshot(context: Context): BatteryHealthSnapshot {
     val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
@@ -123,41 +132,42 @@ object BatteryHealthReader {
       readDesignCapacityMah(context)
     }
 
-    // Check DUMP permission & read dumpsys battery if available
-    val hasDumpPermission = context.checkCallingOrSelfPermission(android.Manifest.permission.DUMP) == PackageManager.PERMISSION_GRANTED
-    val dumpData = if (hasDumpPermission) {
-      readDumpsysBattery()
-    } else {
-      readSysfsFallback()
-    }
+    // Check DUMP permission & read dumpsys battery (via Binder dump, exec, or synced EFS snapshot file)
+    val permGranted = context.checkCallingOrSelfPermission(android.Manifest.permission.DUMP) == PackageManager.PERMISSION_GRANTED
+    val dumpData = readDumpsysBattery(context, permGranted)
+    val hasEfsData = dumpData.asocPercent != null || dumpData.rawUsageCounter != null || dumpData.firstUseDate != null
 
     // Android 14+ standard cycle count extra fallback
-    val intentCycles = intent?.getIntExtra("android.os.extra.CYCLE_COUNT", -1)?.takeIf { it >= 0 }
+    val intentCycles = intent?.getIntExtra("android.os.extra.CYCLE_COUNT", -1)?.takeIf { it > 0 }
     val finalCycles = dumpData.cycleCount ?: intentCycles?.toDouble()
 
-    // Calculate estimated full capacity (mAh) from Coulomb Counter
-    val liveEstimatedFullMah = if (chargeCounterMah > 0 && levelPercent >= 15) {
+    // Calculate estimated full capacity (mAh) from Coulomb Counter ONLY when not fast-charging or at 100%
+    // to prevent voltage hysteresis / integer percentage step jumps (e.g. 91% -> 92% while charging)
+    val liveEstimatedFullMah = if (chargeCounterMah > 0 && levelPercent >= 20) {
       ((chargeCounterMah.toDouble() / levelPercent.toDouble()) * 100.0).roundToInt()
     } else {
       0
     }
 
-    // Save calibrated capacity when battery level is high (>= 70%) for maximum accuracy
-    if (liveEstimatedFullMah in 1000..15000 && levelPercent >= 70) {
+    // Only update saved calibrated mAh when discharging at >= 65% or when battery is FULL (100%)
+    if (liveEstimatedFullMah in 1000..15000 && ((!isCharging && levelPercent >= 65) || levelPercent == 100)) {
       prefs.edit().putInt(KEY_CALIBRATED_FULL_MAH, liveEstimatedFullMah).apply()
     }
     val savedCalibratedMah = prefs.getInt(KEY_CALIBRATED_FULL_MAH, 0)
 
     val estimatedFullCapacityMah = when {
-      dumpData.learnedCapacityMah != null && dumpData.learnedCapacityMah > 1000 -> dumpData.learnedCapacityMah
-      liveEstimatedFullMah in 1000..15000 && levelPercent >= 50 -> liveEstimatedFullMah
-      savedCalibratedMah > 1000 -> savedCalibratedMah
-      liveEstimatedFullMah > 1000 -> liveEstimatedFullMah
       dumpData.asocPercent != null && designCapacityMah > 0 -> ((designCapacityMah * dumpData.asocPercent) / 100.0).roundToInt()
+      dumpData.learnedCapacityMah != null && dumpData.learnedCapacityMah > 1000 -> dumpData.learnedCapacityMah
+      savedCalibratedMah > 1000 -> savedCalibratedMah
+      liveEstimatedFullMah in 1000..15000 -> {
+        // Save initial baseline so it stays stable while charging
+        prefs.edit().putInt(KEY_CALIBRATED_FULL_MAH, liveEstimatedFullMah).apply()
+        liveEstimatedFullMah
+      }
       else -> designCapacityMah
     }
 
-    // Calculate effective health %
+    // Calculate effective health % (prioritizes fixed hardware ASOC % when available)
     val coulombHealthPercent = if (estimatedFullCapacityMah > 0 && designCapacityMah > 0) {
       ((estimatedFullCapacityMah.toDouble() / designCapacityMah.toDouble()) * 100.0).roundToInt().coerceIn(1, 100)
     } else {
@@ -167,9 +177,9 @@ object BatteryHealthReader {
     val effectiveHealthPercent = dumpData.asocPercent?.coerceIn(1, 100) ?: coulombHealthPercent
 
     val dataSourceMode = when {
-      hasDumpPermission && dumpData.asocPercent != null -> "Modo Laboratorio EFS/FuelGauge (Precisión Exacta)"
-      hasDumpPermission -> "Modo Avanzado DUMP + Contador de Culombios"
-      else -> "Modo Universal Android (Fuel Gauge + PowerProfile)"
+      hasEfsData -> "Modo Laboratorio EFS/FuelGauge (Salud Exacta del Chip)"
+      permGranted -> "Modo Avanzado DUMP + Contador de Culombios Estabilizado"
+      else -> "Modo Universal Android (Fuel Gauge Estabilizado)"
     }
 
     val (recTitle, recBody) = buildRecommendation(effectiveHealthPercent, finalCycles, temperatureCelsius)
@@ -178,7 +188,7 @@ object BatteryHealthReader {
       deviceModel = "${Build.MANUFACTURER.replaceFirstChar { it.uppercase() }} ${Build.MODEL}",
       deviceManufacturer = Build.MANUFACTURER,
       androidVersion = "Android ${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT})",
-      hasDumpPermission = hasDumpPermission,
+      hasDumpPermission = permGranted || hasEfsData,
       dataSourceMode = dataSourceMode,
       levelPercent = levelPercent,
       statusText = statusText,
@@ -217,12 +227,10 @@ object BatteryHealthReader {
 
   @SuppressLint("PrivateApi")
   private fun readDesignCapacityMah(context: Context): Int {
-    // 1. Check known device models for exact nominal vs rated capacity
     val model = Build.MODEL.uppercase()
-    if (model.contains("SM-G990")) return 4500 // Samsung Galaxy S21 FE 5G (4500 mAh típica / 4370 mAh nominal)
+    if (model.contains("SM-G990")) return 4500 // Samsung Galaxy S21 FE 5G (4500 mAh típica)
     if (model.contains("T610")) return 5000    // TCL 40 SE (5000 mAh)
 
-    // 2. Reflection on com.android.internal.os.PowerProfile
     try {
       val powerProfileClass = Class.forName("com.android.internal.os.PowerProfile")
       val constructor = powerProfileClass.getConstructor(Context::class.java)
@@ -235,7 +243,6 @@ object BatteryHealthReader {
     } catch (_: Throwable) {
     }
 
-    // 3. Fallback to sysfs charge_full_design
     val sysfsDesign = readSysfsInt("/sys/class/power_supply/battery/charge_full_design")
     if (sysfsDesign != null) {
       return if (sysfsDesign > 100_000) sysfsDesign / 1000 else sysfsDesign
@@ -255,7 +262,63 @@ object BatteryHealthReader {
     val learnedCapacityMah: Int? = null,
   )
 
-  private fun readDumpsysBattery(): DumpParseResult {
+  @SuppressLint("PrivateApi")
+  private fun readBinderDump(serviceName: String): String {
+    return try {
+      val smClass = Class.forName("android.os.ServiceManager")
+      val getService = smClass.getMethod("getService", String::class.java)
+      val binder = getService.invoke(null, serviceName) as? IBinder ?: return ""
+      val pipe = ParcelFileDescriptor.createPipe()
+      val readSide = pipe[0]
+      val writeSide = pipe[1]
+      val dumpThread = Thread {
+        try {
+          binder.dump(writeSide.fileDescriptor, emptyArray())
+        } catch (_: Throwable) {
+        } finally {
+          try {
+            writeSide.close()
+          } catch (_: Throwable) {
+          }
+        }
+      }
+      dumpThread.start()
+      val output = FileInputStream(readSide.fileDescriptor).bufferedReader().use { it.readText() }
+      readSide.close()
+      dumpThread.join(1500)
+      output
+    } catch (_: Throwable) {
+      ""
+    }
+  }
+
+  private fun readDumpsysBattery(context: Context, hasDumpPerm: Boolean): DumpParseResult {
+    val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+    var combinedOutput = ""
+
+    // 1. Try direct Binder IPC dump (bypasses /system/bin/dumpsys SELinux exec restriction)
+    if (hasDumpPerm) {
+      combinedOutput = readBinderDump("battery")
+      if (!combinedOutput.contains("mSavedBatteryAsoc")) {
+        try {
+          val process = Runtime.getRuntime().exec(arrayOf("dumpsys", "battery"))
+          val reader = BufferedReader(InputStreamReader(process.inputStream))
+          combinedOutput += "\n" + reader.readText()
+          reader.close()
+        } catch (_: Throwable) {
+        }
+      }
+    }
+
+    // 2. Also check external files EFS bridge snapshot (written by activar_modo_laboratorio_efs.bat)
+    try {
+      val extFile = File(context.getExternalFilesDir(null), "efs_dump.txt")
+      if (extFile.exists() && extFile.canRead()) {
+        combinedOutput += "\n" + extFile.readText()
+      }
+    } catch (_: Throwable) {
+    }
+
     var asoc: Int? = null
     var bsoh: Int? = null
     var rawUsage: Int? = null
@@ -265,45 +328,54 @@ object BatteryHealthReader {
     var qrRaw: String? = null
     var learnedMah: Int? = null
 
-    try {
-      val process = Runtime.getRuntime().exec(arrayOf("dumpsys", "battery"))
-      val reader = BufferedReader(InputStreamReader(process.inputStream))
-      val output = reader.readText()
-      reader.close()
-
-      // Samsung ASOC: mSavedBatteryAsoc: [88]
-      Regex("""mSavedBatteryAsoc:\s*\[(\d+)]""").find(output)?.groupValues?.get(1)?.toIntOrNull()?.let {
+    if (combinedOutput.isNotBlank()) {
+      Regex("""mSavedBatteryAsoc:\s*\[(\d+)]""").find(combinedOutput)?.groupValues?.get(1)?.toIntOrNull()?.let {
         if (it in 1..100) asoc = it
       }
+      if (asoc == null) {
+        Regex("""AsocData\s+efsValue:(\d+)""").find(combinedOutput)?.groupValues?.get(1)?.toIntOrNull()?.let {
+          if (it in 1..100) asoc = it
+        }
+      }
 
-      // Samsung BSOH: mSavedBatteryBsoh: [100]
-      Regex("""mSavedBatteryBsoh:\s*\[(\d+)]""").find(output)?.groupValues?.get(1)?.toIntOrNull()?.let {
+      Regex("""mSavedBatteryBsoh:\s*\[(\d+)]""").find(combinedOutput)?.groupValues?.get(1)?.toIntOrNull()?.let {
         if (it in 1..100) bsoh = it
       }
 
-      // Samsung Usage / Cycle count: mSavedBatteryUsage: [250798]
-      Regex("""mSavedBatteryUsage:\s*\[(\d+)]""").find(output)?.groupValues?.get(1)?.toIntOrNull()?.let {
+      Regex("""mSavedBatteryUsage:\s*\[(\d+)]""").find(combinedOutput)?.groupValues?.get(1)?.toIntOrNull()?.let {
         rawUsage = it
         cycles = it / 100.0
       }
 
-      // FirstUseDate: battery FirstUseDate: [20230405]
-      Regex("""FirstUseDate:\s*\[(\d{8})]""").find(output)?.groupValues?.get(1)?.let { rawDate ->
+      Regex("""FirstUseDate:\s*\[(\d{8})]""").find(combinedOutput)?.groupValues?.get(1)?.let { rawDate ->
         val year = rawDate.substring(0, 4)
         val month = rawDate.substring(4, 6)
         val day = rawDate.substring(6, 8)
         firstUse = "$day/$month/$year"
       }
 
-      // QrData: [1$GH43-05085A+...]
-      Regex("""QrData:\s*\[([^\]]+)]""").find(output)?.groupValues?.get(1)?.let { qr ->
+      Regex("""QrData:\s*\[([^\]]+)]""").find(combinedOutput)?.groupValues?.get(1)?.let { qr ->
         qrRaw = qr
         Regex("""(GH\d{2}-[0-9A-Z]+)""").find(qr)?.groupValues?.get(1)?.let { part ->
           partNumber = part
         }
       }
-    } catch (_: Throwable) {
     }
+
+    // Persist discovered EFS hardware values in SharedPreferences
+    val editor = prefs.edit()
+    if (asoc != null) editor.putInt(KEY_CACHED_ASOC, asoc!!) else if (prefs.contains(KEY_CACHED_ASOC)) asoc = prefs.getInt(KEY_CACHED_ASOC, -1).takeIf { it in 1..100 }
+    if (bsoh != null) editor.putInt(KEY_CACHED_BSOH, bsoh!!) else if (prefs.contains(KEY_CACHED_BSOH)) bsoh = prefs.getInt(KEY_CACHED_BSOH, -1).takeIf { it in 1..100 }
+    if (rawUsage != null) {
+      editor.putInt(KEY_CACHED_USAGE, rawUsage!!)
+    } else if (prefs.contains(KEY_CACHED_USAGE)) {
+      rawUsage = prefs.getInt(KEY_CACHED_USAGE, -1).takeIf { it > 0 }
+      if (rawUsage != null) cycles = rawUsage!! / 100.0
+    }
+    if (firstUse != null) editor.putString(KEY_CACHED_FIRST_USE, firstUse) else firstUse = prefs.getString(KEY_CACHED_FIRST_USE, null)
+    if (partNumber != null) editor.putString(KEY_CACHED_PART, partNumber) else partNumber = prefs.getString(KEY_CACHED_PART, null)
+    if (qrRaw != null) editor.putString(KEY_CACHED_QR, qrRaw) else qrRaw = prefs.getString(KEY_CACHED_QR, null)
+    editor.apply()
 
     // Fallback to sysfs if any metric wasn't in dumpsys battery
     if (asoc == null) {
@@ -327,22 +399,6 @@ object BatteryHealthReader {
       firstUseDate = firstUse,
       partNumber = partNumber,
       serialQrRaw = qrRaw,
-      learnedCapacityMah = learnedMah,
-    )
-  }
-
-  private fun readSysfsFallback(): DumpParseResult {
-    val asoc = readSysfsInt("/sys/class/power_supply/battery/fg_asoc")?.takeIf { it in 1..100 }
-    val cycles = readSysfsInt("/sys/class/power_supply/battery/cycle_count")?.takeIf { it > 0 }?.toDouble()
-    val sysfsFull = readSysfsInt("/sys/class/power_supply/battery/charge_full")
-    val learnedMah = if (sysfsFull != null && sysfsFull > 1000) {
-      if (sysfsFull > 100_000) sysfsFull / 1000 else sysfsFull
-    } else {
-      null
-    }
-    return DumpParseResult(
-      asocPercent = asoc,
-      cycleCount = cycles,
       learnedCapacityMah = learnedMah,
     )
   }

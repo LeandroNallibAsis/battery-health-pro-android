@@ -14,12 +14,15 @@ if exist "%LOCALAPPDATA%\Android\Sdk\platform-tools\adb.exe" (
     set "ADB_CMD=%LOCALAPPDATA%\Android\Sdk\platform-tools\adb.exe"
 )
 
-echo [1/2] Verificando dispositivos conectados...
+echo [1/3] Verificando dispositivos conectados...
 "%ADB_CMD%" devices
 echo.
-echo [2/2] Otorgando permiso permanente DUMP y BATTERY_STATS a Battery Health Pro...
+echo [2/3] Otorgando permiso permanente DUMP y BATTERY_STATS a Battery Health Pro...
 "%ADB_CMD%" shell pm grant com.leandro.batteryhealth android.permission.DUMP
 "%ADB_CMD%" shell pm grant com.leandro.batteryhealth android.permission.BATTERY_STATS
+echo.
+echo [3/3] Sincronizando registros internos del chip EFS (ASOC, Ciclos, 1er Uso, QR)...
+"%ADB_CMD%" shell "mkdir -p /sdcard/Android/data/com.leandro.batteryhealth/files && dumpsys battery > /sdcard/Android/data/com.leandro.batteryhealth/files/efs_dump.txt"
 
 echo.
 echo ============================================================================
