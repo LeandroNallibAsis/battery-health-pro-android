@@ -7,11 +7,9 @@ import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.os.BatteryManager
 import android.os.Build
-import android.os.IBinder
-import android.os.ParcelFileDescriptor
+import android.provider.Settings
 import java.io.BufferedReader
 import java.io.File
-import java.io.FileInputStream
 import java.io.InputStreamReader
 import kotlin.math.abs
 import kotlin.math.roundToInt
@@ -58,6 +56,34 @@ object BatteryHealthReader {
   private const val KEY_CACHED_FIRST_USE = "cached_first_use"
   private const val KEY_CACHED_PART = "cached_part"
   private const val KEY_CACHED_QR = "cached_qr"
+
+  fun ingestIntentExtras(context: Context, intent: Intent?) {
+    if (intent == null) return
+    val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+    val editor = prefs.edit()
+    var changed = false
+
+    intent.getStringExtra("efs_asoc")?.toIntOrNull()?.takeIf { it in 1..100 }?.let {
+      editor.putInt(KEY_CACHED_ASOC, it)
+      changed = true
+    }
+    intent.getStringExtra("efs_usage")?.toIntOrNull()?.takeIf { it > 0 }?.let {
+      editor.putInt(KEY_CACHED_USAGE, it)
+      changed = true
+    }
+    intent.getStringExtra("efs_first_use")?.takeIf { it.isNotBlank() }?.let {
+      editor.putString(KEY_CACHED_FIRST_USE, formatFirstUseDate(it))
+      changed = true
+    }
+    intent.getStringExtra("efs_qr")?.takeIf { it.isNotBlank() }?.let { qr ->
+      editor.putString(KEY_CACHED_QR, qr)
+      Regex("""(GH\d{2}-[0-9A-Z]+)""").find(qr)?.groupValues?.get(1)?.let { part ->
+        editor.putString(KEY_CACHED_PART, part)
+      }
+      changed = true
+    }
+    if (changed) editor.apply()
+  }
 
   fun readSnapshot(context: Context): BatteryHealthSnapshot {
     val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
@@ -132,9 +158,9 @@ object BatteryHealthReader {
       readDesignCapacityMah(context)
     }
 
-    // Check DUMP permission & read dumpsys battery (via Binder dump, exec, or synced EFS snapshot file)
+    // Read EFS / DUMP data from Settings.Global bridge, SharedPreferences, dumpsys, or sysfs
     val permGranted = context.checkCallingOrSelfPermission(android.Manifest.permission.DUMP) == PackageManager.PERMISSION_GRANTED
-    val dumpData = readDumpsysBattery(context, permGranted)
+    val dumpData = readEfsAndDumpData(context, permGranted)
     val hasEfsData = dumpData.asocPercent != null || dumpData.rawUsageCounter != null || dumpData.firstUseDate != null
 
     // Android 14+ standard cycle count extra fallback
@@ -142,14 +168,12 @@ object BatteryHealthReader {
     val finalCycles = dumpData.cycleCount ?: intentCycles?.toDouble()
 
     // Calculate estimated full capacity (mAh) from Coulomb Counter ONLY when not fast-charging or at 100%
-    // to prevent voltage hysteresis / integer percentage step jumps (e.g. 91% -> 92% while charging)
     val liveEstimatedFullMah = if (chargeCounterMah > 0 && levelPercent >= 20) {
       ((chargeCounterMah.toDouble() / levelPercent.toDouble()) * 100.0).roundToInt()
     } else {
       0
     }
 
-    // Only update saved calibrated mAh when discharging at >= 65% or when battery is FULL (100%)
     if (liveEstimatedFullMah in 1000..15000 && ((!isCharging && levelPercent >= 65) || levelPercent == 100)) {
       prefs.edit().putInt(KEY_CALIBRATED_FULL_MAH, liveEstimatedFullMah).apply()
     }
@@ -160,14 +184,12 @@ object BatteryHealthReader {
       dumpData.learnedCapacityMah != null && dumpData.learnedCapacityMah > 1000 -> dumpData.learnedCapacityMah
       savedCalibratedMah > 1000 -> savedCalibratedMah
       liveEstimatedFullMah in 1000..15000 -> {
-        // Save initial baseline so it stays stable while charging
         prefs.edit().putInt(KEY_CALIBRATED_FULL_MAH, liveEstimatedFullMah).apply()
         liveEstimatedFullMah
       }
       else -> designCapacityMah
     }
 
-    // Calculate effective health % (prioritizes fixed hardware ASOC % when available)
     val coulombHealthPercent = if (estimatedFullCapacityMah > 0 && designCapacityMah > 0) {
       ((estimatedFullCapacityMah.toDouble() / designCapacityMah.toDouble()) * 100.0).roundToInt().coerceIn(1, 100)
     } else {
@@ -177,8 +199,8 @@ object BatteryHealthReader {
     val effectiveHealthPercent = dumpData.asocPercent?.coerceIn(1, 100) ?: coulombHealthPercent
 
     val dataSourceMode = when {
-      hasEfsData -> "Modo Laboratorio EFS/FuelGauge (Salud Exacta del Chip)"
-      permGranted -> "Modo Avanzado DUMP + Contador de Culombios Estabilizado"
+      hasEfsData -> "Modo Laboratorio EFS Activo (Salud Oficial del Chip)"
+      permGranted -> "Modo Avanzado DUMP + Contador de Culombios"
       else -> "Modo Universal Android (Fuel Gauge Estabilizado)"
     }
 
@@ -188,7 +210,7 @@ object BatteryHealthReader {
       deviceModel = "${Build.MANUFACTURER.replaceFirstChar { it.uppercase() }} ${Build.MODEL}",
       deviceManufacturer = Build.MANUFACTURER,
       androidVersion = "Android ${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT})",
-      hasDumpPermission = permGranted || hasEfsData,
+      hasDumpPermission = hasEfsData || permGranted,
       dataSourceMode = dataSourceMode,
       levelPercent = levelPercent,
       statusText = statusText,
@@ -225,11 +247,23 @@ object BatteryHealthReader {
     }
   }
 
+  private fun formatFirstUseDate(rawDate: String): String {
+    val clean = rawDate.trim()
+    return if (clean.length == 8 && clean.all { it.isDigit() }) {
+      val year = clean.substring(0, 4)
+      val month = clean.substring(4, 6)
+      val day = clean.substring(6, 8)
+      "$day/$month/$year"
+    } else {
+      clean
+    }
+  }
+
   @SuppressLint("PrivateApi")
   private fun readDesignCapacityMah(context: Context): Int {
     val model = Build.MODEL.uppercase()
-    if (model.contains("SM-G990")) return 4500 // Samsung Galaxy S21 FE 5G (4500 mAh típica)
-    if (model.contains("T610")) return 5000    // TCL 40 SE (5000 mAh)
+    if (model.contains("SM-G990")) return 4500 // Samsung Galaxy S21 FE 5G
+    if (model.contains("T610")) return 5000    // TCL 40 SE
 
     try {
       val powerProfileClass = Class.forName("com.android.internal.os.PowerProfile")
@@ -262,62 +296,9 @@ object BatteryHealthReader {
     val learnedCapacityMah: Int? = null,
   )
 
-  @SuppressLint("PrivateApi")
-  private fun readBinderDump(serviceName: String): String {
-    return try {
-      val smClass = Class.forName("android.os.ServiceManager")
-      val getService = smClass.getMethod("getService", String::class.java)
-      val binder = getService.invoke(null, serviceName) as? IBinder ?: return ""
-      val pipe = ParcelFileDescriptor.createPipe()
-      val readSide = pipe[0]
-      val writeSide = pipe[1]
-      val dumpThread = Thread {
-        try {
-          binder.dump(writeSide.fileDescriptor, emptyArray())
-        } catch (_: Throwable) {
-        } finally {
-          try {
-            writeSide.close()
-          } catch (_: Throwable) {
-          }
-        }
-      }
-      dumpThread.start()
-      val output = FileInputStream(readSide.fileDescriptor).bufferedReader().use { it.readText() }
-      readSide.close()
-      dumpThread.join(1500)
-      output
-    } catch (_: Throwable) {
-      ""
-    }
-  }
-
-  private fun readDumpsysBattery(context: Context, hasDumpPerm: Boolean): DumpParseResult {
+  private fun readEfsAndDumpData(context: Context, hasDumpPerm: Boolean): DumpParseResult {
     val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-    var combinedOutput = ""
-
-    // 1. Try direct Binder IPC dump (bypasses /system/bin/dumpsys SELinux exec restriction)
-    if (hasDumpPerm) {
-      combinedOutput = readBinderDump("battery")
-      if (!combinedOutput.contains("mSavedBatteryAsoc")) {
-        try {
-          val process = Runtime.getRuntime().exec(arrayOf("dumpsys", "battery"))
-          val reader = BufferedReader(InputStreamReader(process.inputStream))
-          combinedOutput += "\n" + reader.readText()
-          reader.close()
-        } catch (_: Throwable) {
-        }
-      }
-    }
-
-    // 2. Also check external files EFS bridge snapshot (written by activar_modo_laboratorio_efs.bat)
-    try {
-      val extFile = File(context.getExternalFilesDir(null), "efs_dump.txt")
-      if (extFile.exists() && extFile.canRead()) {
-        combinedOutput += "\n" + extFile.readText()
-      }
-    } catch (_: Throwable) {
-    }
+    val cr = context.contentResolver
 
     var asoc: Int? = null
     var bsoh: Int? = null
@@ -328,56 +309,94 @@ object BatteryHealthReader {
     var qrRaw: String? = null
     var learnedMah: Int? = null
 
-    if (combinedOutput.isNotBlank()) {
-      Regex("""mSavedBatteryAsoc:\s*\[(\d+)]""").find(combinedOutput)?.groupValues?.get(1)?.toIntOrNull()?.let {
-        if (it in 1..100) asoc = it
+    // 1. Read Settings.Global EFS bridge keys (world-readable by any app without SELinux file blocks)
+    try {
+      Settings.Global.getString(cr, "bh_efs_asoc")?.trim()?.toIntOrNull()?.takeIf { it in 1..100 }?.let {
+        asoc = it
       }
-      if (asoc == null) {
-        Regex("""AsocData\s+efsValue:(\d+)""").find(combinedOutput)?.groupValues?.get(1)?.toIntOrNull()?.let {
-          if (it in 1..100) asoc = it
-        }
+      Settings.Global.getString(cr, "bh_efs_bsoh")?.trim()?.toIntOrNull()?.takeIf { it in 1..100 }?.let {
+        bsoh = it
       }
-
-      Regex("""mSavedBatteryBsoh:\s*\[(\d+)]""").find(combinedOutput)?.groupValues?.get(1)?.toIntOrNull()?.let {
-        if (it in 1..100) bsoh = it
-      }
-
-      Regex("""mSavedBatteryUsage:\s*\[(\d+)]""").find(combinedOutput)?.groupValues?.get(1)?.toIntOrNull()?.let {
+      Settings.Global.getString(cr, "bh_efs_usage")?.trim()?.toIntOrNull()?.takeIf { it > 0 }?.let {
         rawUsage = it
         cycles = it / 100.0
       }
-
-      Regex("""FirstUseDate:\s*\[(\d{8})]""").find(combinedOutput)?.groupValues?.get(1)?.let { rawDate ->
-        val year = rawDate.substring(0, 4)
-        val month = rawDate.substring(4, 6)
-        val day = rawDate.substring(6, 8)
-        firstUse = "$day/$month/$year"
+      Settings.Global.getString(cr, "bh_efs_first_use")?.trim()?.takeIf { it.isNotBlank() }?.let {
+        firstUse = formatFirstUseDate(it)
       }
-
-      Regex("""QrData:\s*\[([^\]]+)]""").find(combinedOutput)?.groupValues?.get(1)?.let { qr ->
+      Settings.Global.getString(cr, "bh_efs_qr")?.trim()?.takeIf { it.isNotBlank() }?.let { qr ->
         qrRaw = qr
         Regex("""(GH\d{2}-[0-9A-Z]+)""").find(qr)?.groupValues?.get(1)?.let { part ->
           partNumber = part
         }
       }
+    } catch (_: Throwable) {
     }
 
-    // Persist discovered EFS hardware values in SharedPreferences
+    // 2. Also try dumpsys battery if permitted by SELinux
+    if (hasDumpPerm && asoc == null) {
+      try {
+        val process = Runtime.getRuntime().exec(arrayOf("dumpsys", "battery"))
+        val reader = BufferedReader(InputStreamReader(process.inputStream))
+        val output = reader.readText()
+        reader.close()
+
+        Regex("""mSavedBatteryAsoc:\s*\[(\d+)]""").find(output)?.groupValues?.get(1)?.toIntOrNull()?.let {
+          if (it in 1..100) asoc = it
+        }
+        Regex("""mSavedBatteryUsage:\s*\[(\d+)]""").find(output)?.groupValues?.get(1)?.toIntOrNull()?.let {
+          rawUsage = it
+          cycles = it / 100.0
+        }
+        Regex("""FirstUseDate:\s*\[(\d{8})]""").find(output)?.groupValues?.get(1)?.let {
+          firstUse = formatFirstUseDate(it)
+        }
+        Regex("""QrData(?::\s*\[|\s+efsValue:)([^\s\]]+)""").find(output)?.groupValues?.get(1)?.let { qr ->
+          qrRaw = qr
+          Regex("""(GH\d{2}-[0-9A-Z]+)""").find(qr)?.groupValues?.get(1)?.let { part ->
+            partNumber = part
+          }
+        }
+      } catch (_: Throwable) {
+      }
+    }
+
+    // 3. Persist/restore in SharedPreferences
     val editor = prefs.edit()
-    if (asoc != null) editor.putInt(KEY_CACHED_ASOC, asoc!!) else if (prefs.contains(KEY_CACHED_ASOC)) asoc = prefs.getInt(KEY_CACHED_ASOC, -1).takeIf { it in 1..100 }
-    if (bsoh != null) editor.putInt(KEY_CACHED_BSOH, bsoh!!) else if (prefs.contains(KEY_CACHED_BSOH)) bsoh = prefs.getInt(KEY_CACHED_BSOH, -1).takeIf { it in 1..100 }
+    if (asoc != null) {
+      editor.putInt(KEY_CACHED_ASOC, asoc)
+    } else if (prefs.contains(KEY_CACHED_ASOC)) {
+      asoc = prefs.getInt(KEY_CACHED_ASOC, -1).takeIf { it in 1..100 }
+    }
+    if (bsoh != null) {
+      editor.putInt(KEY_CACHED_BSOH, bsoh)
+    } else if (prefs.contains(KEY_CACHED_BSOH)) {
+      bsoh = prefs.getInt(KEY_CACHED_BSOH, -1).takeIf { it in 1..100 }
+    }
     if (rawUsage != null) {
-      editor.putInt(KEY_CACHED_USAGE, rawUsage!!)
+      editor.putInt(KEY_CACHED_USAGE, rawUsage)
     } else if (prefs.contains(KEY_CACHED_USAGE)) {
       rawUsage = prefs.getInt(KEY_CACHED_USAGE, -1).takeIf { it > 0 }
-      if (rawUsage != null) cycles = rawUsage!! / 100.0
+      if (rawUsage != null) cycles = rawUsage / 100.0
     }
-    if (firstUse != null) editor.putString(KEY_CACHED_FIRST_USE, firstUse) else firstUse = prefs.getString(KEY_CACHED_FIRST_USE, null)
-    if (partNumber != null) editor.putString(KEY_CACHED_PART, partNumber) else partNumber = prefs.getString(KEY_CACHED_PART, null)
-    if (qrRaw != null) editor.putString(KEY_CACHED_QR, qrRaw) else qrRaw = prefs.getString(KEY_CACHED_QR, null)
+    if (firstUse != null) {
+      editor.putString(KEY_CACHED_FIRST_USE, firstUse)
+    } else {
+      firstUse = prefs.getString(KEY_CACHED_FIRST_USE, null)
+    }
+    if (partNumber != null) {
+      editor.putString(KEY_CACHED_PART, partNumber)
+    } else {
+      partNumber = prefs.getString(KEY_CACHED_PART, null)
+    }
+    if (qrRaw != null) {
+      editor.putString(KEY_CACHED_QR, qrRaw)
+    } else {
+      qrRaw = prefs.getString(KEY_CACHED_QR, null)
+    }
     editor.apply()
 
-    // Fallback to sysfs if any metric wasn't in dumpsys battery
+    // 4. Fallback to sysfs if any metric wasn't found
     if (asoc == null) {
       asoc = readSysfsInt("/sys/class/power_supply/battery/fg_asoc")?.takeIf { it in 1..100 }
     }

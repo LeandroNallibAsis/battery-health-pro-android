@@ -74,6 +74,7 @@ import java.util.Locale
 class MainActivity : ComponentActivity() {
   override fun onCreate(savedInstanceState: Bundle?) {
     super.onCreate(savedInstanceState)
+    BatteryHealthReader.ingestIntentExtras(this, intent)
     enableEdgeToEdge()
     setContent {
       BatteryHealthProTheme(darkTheme = true) {
@@ -85,6 +86,11 @@ class MainActivity : ComponentActivity() {
         }
       }
     }
+  }
+
+  override fun onNewIntent(intent: android.content.Intent) {
+    super.onNewIntent(intent)
+    BatteryHealthReader.ingestIntentExtras(this, intent)
   }
 }
 
@@ -125,8 +131,21 @@ fun BatteryHealthDashboard() {
           }
         },
         actions = {
+          TextButton(
+            onClick = {
+              snapshot = BatteryHealthReader.readSnapshot(context)
+              refreshTrigger++
+              Toast.makeText(
+                context,
+                "Salud verificada: ${snapshot.effectiveHealthPercent}% (${if (snapshot.asocHardwarePercent != null) "Chip EFS Oficial" else "Contador mAh"})",
+                Toast.LENGTH_SHORT,
+              ).show()
+            },
+          ) {
+            Text("Actualizar", color = Color(0xFF3FB950), fontWeight = FontWeight.Bold)
+          }
           TextButton(onClick = { showCapacityDialog = true }) {
-            Text("Calibrar mAh", color = Color(0xFF58A6FF), fontWeight = FontWeight.SemiBold)
+            Text("mAh Fábrica", color = Color(0xFF58A6FF), fontWeight = FontWeight.SemiBold)
           }
         },
         colors = TopAppBarDefaults.topAppBarColors(
